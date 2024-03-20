@@ -76,10 +76,13 @@ class RVC:
             # device="cpu"########强制cpu测试
             self.device = config.device
             self.f0_up_key = key
+            self.time_step = 160 / 16000 * 1000
             self.f0_min = 50
             self.f0_max = 1100
             self.f0_mel_min = 1127 * np.log(1 + self.f0_min / 700)
             self.f0_mel_max = 1127 * np.log(1 + self.f0_max / 700)
+            self.sr = 16000
+            self.window = 160
             self.n_cpu = n_cpu
             self.use_jit = self.config.use_jit
             self.is_half = config.is_half
@@ -91,12 +94,6 @@ class RVC:
             self.pth_path: str = pth_path
             self.index_path = index_path
             self.index_rate = index_rate
-            self.cache_pitch: torch.Tensor = torch.zeros(
-                1024, device=self.device, dtype=torch.long
-            )
-            self.cache_pitchf = torch.zeros(
-                1024, device=self.device, dtype=torch.float32
-            )
 
             if last_rvc is None:
                 models, _, _ = fairseq.checkpoint_utils.load_model_ensemble_and_task(
@@ -186,9 +183,6 @@ class RVC:
 
             if last_rvc is not None and hasattr(last_rvc, "model_rmvpe"):
                 self.model_rmvpe = last_rvc.model_rmvpe
-            if last_rvc is not None and hasattr(last_rvc, "model_fcpe"):
-                self.device_fcpe = last_rvc.device_fcpe
-                self.model_fcpe = last_rvc.model_fcpe
         except:
             printt(traceback.format_exc())
 
@@ -203,17 +197,19 @@ class RVC:
         self.index_rate = new_index_rate
 
     def get_f0_post(self, f0):
-        if not torch.is_tensor(f0):
-            f0 = torch.from_numpy(f0)
-        f0 = f0.float().to(self.device).squeeze()
-        f0_mel = 1127 * torch.log(1 + f0 / 700)
-        f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - self.f0_mel_min) * 254 / (
-            self.f0_mel_max - self.f0_mel_min
+        f0_min = self.f0_min
+        f0_max = self.f0_max
+        f0_mel_min = 1127 * np.log(1 + f0_min / 700)
+        f0_mel_max = 1127 * np.log(1 + f0_max / 700)
+        f0bak = f0.copy()
+        f0_mel = 1127 * np.log(1 + f0 / 700)
+        f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - f0_mel_min) * 254 / (
+            f0_mel_max - f0_mel_min
         ) + 1
         f0_mel[f0_mel <= 1] = 1
         f0_mel[f0_mel > 255] = 255
-        f0_coarse = torch.round(f0_mel).long()
-        return f0_coarse, f0
+        f0_coarse = np.rint(f0_mel).astype(np.int32)
+        return f0_coarse, f0bak
 
     def get_f0(self, x, f0_up_key, n_cpu, method="harvest"):
         n_cpu = int(n_cpu)
@@ -221,25 +217,26 @@ class RVC:
             return self.get_f0_crepe(x, f0_up_key)
         if method == "rmvpe":
             return self.get_f0_rmvpe(x, f0_up_key)
-        if method == "fcpe":
-            return self.get_f0_fcpe(x, f0_up_key)
-        x = x.cpu().numpy()
         if method == "pm":
             p_len = x.shape[0] // 160 + 1
-            f0_min = 65
-            l_pad = int(np.ceil(1.5 / f0_min * 16000))
-            r_pad = l_pad + 1
-            s = parselmouth.Sound(np.pad(x, (l_pad, r_pad)), 16000).to_pitch_ac(
-                time_step=0.01,
-                voicing_threshold=0.6,
-                pitch_floor=f0_min,
-                pitch_ceiling=1100,
+            f0 = (
+                parselmouth.Sound(x, 16000)
+                .to_pitch_ac(
+                    time_step=0.01,
+                    voicing_threshold=0.6,
+                    pitch_floor=50,
+                    pitch_ceiling=1100,
+                )
+                .selected_array["frequency"]
             )
-            assert np.abs(s.t1 - 1.5 / f0_min) < 0.001
-            f0 = s.selected_array["frequency"]
-            if len(f0) < p_len:
-                f0 = np.pad(f0, (0, p_len - len(f0)))
-            f0 = f0[:p_len]
+
+            pad_size = (p_len - len(f0) + 1) // 2
+            if pad_size > 0 or p_len - len(f0) - pad_size > 0:
+                # printt(pad_size, p_len - len(f0) - pad_size)
+                f0 = np.pad(
+                    f0, [[pad_size, p_len - len(f0) - pad_size]], mode="constant"
+                )
+
             f0 *= pow(2, f0_up_key / 12)
             return self.get_f0_post(f0)
         if n_cpu == 1:
@@ -279,22 +276,21 @@ class RVC:
                 f0 = f0[2:-3]
             else:
                 f0 = f0[2:]
-            f0bak[part_length * idx // 160 : part_length * idx // 160 + f0.shape[0]] = (
-                f0
-            )
+            f0bak[
+                part_length * idx // 160 : part_length * idx // 160 + f0.shape[0]
+            ] = f0
         f0bak = signal.medfilt(f0bak, 3)
         f0bak *= pow(2, f0_up_key / 12)
         return self.get_f0_post(f0bak)
 
     def get_f0_crepe(self, x, f0_up_key):
-        if "privateuseone" in str(
-            self.device
-        ):  ###不支持dml，cpu又太慢用不成，拿fcpe顶替
-            return self.get_f0(x, f0_up_key, 1, "fcpe")
+        if "privateuseone" in str(self.device):  ###不支持dml，cpu又太慢用不成，拿pm顶替
+            return self.get_f0(x, f0_up_key, 1, "pm")
+        audio = torch.tensor(np.copy(x))[None].float()
         # printt("using crepe,device:%s"%self.device)
         f0, pd = torchcrepe.predict(
-            x.unsqueeze(0).float(),
-            16000,
+            audio,
+            self.sr,
             160,
             self.f0_min,
             self.f0_max,
@@ -307,6 +303,7 @@ class RVC:
         pd = torchcrepe.filter.median(pd, 3)
         f0 = torchcrepe.filter.mean(f0, 3)
         f0[pd < 0.1] = 0
+        f0 = f0[0].cpu().numpy()
         f0 *= pow(2, f0_up_key / 12)
         return self.get_f0_post(f0)
 
@@ -316,48 +313,37 @@ class RVC:
 
             printt("Loading rmvpe model")
             self.model_rmvpe = RMVPE(
+                # "rmvpe.pt", is_half=self.is_half if self.device.type!="privateuseone" else False, device=self.device if self.device.type!="privateuseone"else "cpu"####dml时强制对rmvpe用cpu跑
+                #  "rmvpe.pt", is_half=False, device=self.device####dml配置
+                # "rmvpe.pt", is_half=False, device="cpu"####锁定cpu配置
                 "assets/rmvpe/rmvpe.pt",
                 is_half=self.is_half,
-                device=self.device,
+                device=self.device,  ####正常逻辑
                 use_jit=self.config.use_jit,
             )
+            # self.model_rmvpe = RMVPE("aug2_58000_half.pt", is_half=self.is_half, device=self.device)
         f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
-        f0 *= pow(2, f0_up_key / 12)
-        return self.get_f0_post(f0)
-
-    def get_f0_fcpe(self, x, f0_up_key):
-        if hasattr(self, "model_fcpe") == False:
-            from torchfcpe import spawn_bundled_infer_model
-
-            printt("Loading fcpe model")
-            if "privateuseone" in str(self.device):
-                self.device_fcpe = "cpu"
-            else:
-                self.device_fcpe = self.device
-            self.model_fcpe = spawn_bundled_infer_model(self.device_fcpe)
-        f0 = self.model_fcpe.infer(
-            x.to(self.device_fcpe).unsqueeze(0).float(),
-            sr=16000,
-            decoder_mode="local_argmax",
-            threshold=0.006,
-        )
         f0 *= pow(2, f0_up_key / 12)
         return self.get_f0_post(f0)
 
     def infer(
         self,
-        input_wav: torch.Tensor,
+        feats: torch.Tensor,
+        indata: np.ndarray,
         block_frame_16k,
-        skip_head,
-        return_length,
+        rate,
+        cache_pitch,
+        cache_pitchf,
         f0method,
     ) -> np.ndarray:
+        feats = feats.view(1, -1)
+        if self.config.is_half:
+            feats = feats.half()
+        else:
+            feats = feats.float()
+        feats = feats.to(self.device)
         t1 = ttime()
         with torch.no_grad():
-            if self.config.is_half:
-                feats = input_wav.half().view(1, -1)
-            else:
-                feats = input_wav.float().view(1, -1)
             padding_mask = torch.BoolTensor(feats.shape).to(self.device).fill_(False)
             inputs = {
                 "source": feats,
@@ -368,78 +354,72 @@ class RVC:
             feats = (
                 self.model.final_proj(logits[0]) if self.version == "v1" else logits[0]
             )
-            feats = torch.cat((feats, feats[:, -1:, :]), 1)
+            feats = F.pad(feats, (0, 0, 1, 0))
         t2 = ttime()
         try:
             if hasattr(self, "index") and self.index_rate != 0:
-                npy = feats[0][skip_head // 2 :].cpu().numpy().astype("float32")
+                leng_replace_head = int(rate * feats[0].shape[0])
+                npy = feats[0][-leng_replace_head:].cpu().numpy().astype("float32")
                 score, ix = self.index.search(npy, k=8)
-                if (ix >= 0).all():
-                    weight = np.square(1 / score)
-                    weight /= weight.sum(axis=1, keepdims=True)
-                    npy = np.sum(
-                        self.big_npy[ix] * np.expand_dims(weight, axis=2), axis=1
-                    )
-                    if self.config.is_half:
-                        npy = npy.astype("float16")
-                    feats[0][skip_head // 2 :] = (
-                        torch.from_numpy(npy).unsqueeze(0).to(self.device)
-                        * self.index_rate
-                        + (1 - self.index_rate) * feats[0][skip_head // 2 :]
-                    )
-                else:
-                    printt(
-                        "Invalid index. You MUST use added_xxxx.index but not trained_xxxx.index!"
-                    )
+                weight = np.square(1 / score)
+                weight /= weight.sum(axis=1, keepdims=True)
+                npy = np.sum(self.big_npy[ix] * np.expand_dims(weight, axis=2), axis=1)
+                if self.config.is_half:
+                    npy = npy.astype("float16")
+                feats[0][-leng_replace_head:] = (
+                    torch.from_numpy(npy).unsqueeze(0).to(self.device) * self.index_rate
+                    + (1 - self.index_rate) * feats[0][-leng_replace_head:]
+                )
             else:
                 printt("Index search FAILED or disabled")
         except:
-            traceback.print_exc()
+            traceback.printt_exc()
             printt("Index search FAILED")
-        t3 = ttime()
-        p_len = input_wav.shape[0] // 160
-        if self.if_f0 == 1:
-            f0_extractor_frame = block_frame_16k + 800
-            if f0method == "rmvpe":
-                f0_extractor_frame = 5120 * ((f0_extractor_frame - 1) // 5120 + 1) - 160
-            pitch, pitchf = self.get_f0(
-                input_wav[-f0_extractor_frame:], self.f0_up_key, self.n_cpu, f0method
-            )
-            shift = block_frame_16k // 160
-            self.cache_pitch[:-shift] = self.cache_pitch[shift:].clone()
-            self.cache_pitchf[:-shift] = self.cache_pitchf[shift:].clone()
-            self.cache_pitch[4 - pitch.shape[0] :] = pitch[3:-1]
-            self.cache_pitchf[4 - pitch.shape[0] :] = pitchf[3:-1]
-            cache_pitch = self.cache_pitch[None, -p_len:]
-            cache_pitchf = self.cache_pitchf[None, -p_len:]
-        t4 = ttime()
         feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
+        t3 = ttime()
+        if self.if_f0 == 1:
+            pitch, pitchf = self.get_f0(indata, self.f0_up_key, self.n_cpu, f0method)
+            start_frame = block_frame_16k // 160
+            end_frame = len(cache_pitch) - (pitch.shape[0] - 4) + start_frame
+            cache_pitch[:] = np.append(cache_pitch[start_frame:end_frame], pitch[3:-1])
+            cache_pitchf[:] = np.append(
+                cache_pitchf[start_frame:end_frame], pitchf[3:-1]
+            )
+            p_len = min(feats.shape[1], 13000, cache_pitch.shape[0])
+        else:
+            cache_pitch, cache_pitchf = None, None
+            p_len = min(feats.shape[1], 13000)
+        t4 = ttime()
         feats = feats[:, :p_len, :]
+        if self.if_f0 == 1:
+            cache_pitch = cache_pitch[:p_len]
+            cache_pitchf = cache_pitchf[:p_len]
+            cache_pitch = torch.LongTensor(cache_pitch).unsqueeze(0).to(self.device)
+            cache_pitchf = torch.FloatTensor(cache_pitchf).unsqueeze(0).to(self.device)
         p_len = torch.LongTensor([p_len]).to(self.device)
-        sid = torch.LongTensor([0]).to(self.device)
-        skip_head = torch.LongTensor([skip_head])
-        return_length = torch.LongTensor([return_length])
+        ii = 0  # sid
+        sid = torch.LongTensor([ii]).to(self.device)
         with torch.no_grad():
             if self.if_f0 == 1:
-                infered_audio, _, _ = self.net_g.infer(
+                # printt(12222222222,feats.device,p_len.device,cache_pitch.device,cache_pitchf.device,sid.device,rate2)
+                infered_audio = self.net_g.infer(
                     feats,
                     p_len,
                     cache_pitch,
                     cache_pitchf,
                     sid,
-                    skip_head,
-                    return_length,
-                )
+                    torch.FloatTensor([rate]),
+                )[0][0, 0].data.float()
             else:
-                infered_audio, _, _ = self.net_g.infer(
-                    feats, p_len, sid, skip_head, return_length
-                )
+                infered_audio = self.net_g.infer(
+                    feats, p_len, sid, torch.FloatTensor([rate])
+                )[0][0, 0].data.float()
         t5 = ttime()
         printt(
-            "Spent time: fea = %.3fs, index = %.3fs, f0 = %.3fs, model = %.3fs",
+            "Spent time: fea = %.2fs, index = %.2fs, f0 = %.2fs, model = %.2fs",
             t2 - t1,
             t3 - t2,
             t4 - t3,
             t5 - t4,
         )
-        return infered_audio.squeeze().float()
+        return infered_audio

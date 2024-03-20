@@ -34,5 +34,4 @@ def get_synthesizer(pth_path, device=torch.device("cpu")):
     net_g.load_state_dict(cpt["weight"], strict=False)
     net_g = net_g.float()
     net_g.eval().to(device)
-    net_g.remove_weight_norm()
     return net_g, cpt

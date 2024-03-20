@@ -27,4 +27,3 @@ sounddevice
 gradio
 noisereduce
 onnxruntime-directml
-torchfcpe

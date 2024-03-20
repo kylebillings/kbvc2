@@ -26,4 +26,3 @@ PySimpleGUI
 sounddevice
 gradio
 noisereduce
-torchfcpe
