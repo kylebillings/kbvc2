@@ -31,7 +31,7 @@ def printt(strr):
 
 
 class FeatureInput(object):
-    def __init__(self, samplerate=16000, hop_size=160):
+    def __init__(self, samplerate=16000, hop_size=64):
         self.fs = samplerate
         self.hop = hop_size
 
