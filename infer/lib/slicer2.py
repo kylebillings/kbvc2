@@ -4,8 +4,8 @@ import numpy as np
 # This function is obtained from librosa.
 def get_rms(
     y,
-    frame_length=2048,
-    hop_length=512,
+    frame_length=512,
+    hop_length=128,
     pad_mode="constant",
 ):
     padding = (int(frame_length // 2), int(frame_length // 2))
@@ -39,11 +39,11 @@ class Slicer:
     def __init__(
         self,
         sr: int,
-        threshold: float = -40.0,
+        threshold: float = -50.0,
         min_length: int = 5000,
-        min_interval: int = 300,
+        min_interval: int = 100,
         hop_size: int = 20,
-        max_sil_kept: int = 5000,
+        max_sil_kept: int = 3000,
     ):
         if not min_length >= min_interval >= hop_size:
             raise ValueError(
