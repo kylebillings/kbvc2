@@ -52,7 +52,7 @@ class PreProcess:
         )
         self.sr = sr
         self.bh, self.ah = signal.butter(N=5, Wn=48, btype="high", fs=self.sr)
-        self.per = per
+        self.per = 10
         self.overlap = 0.3
         self.tail = self.per + self.overlap
         self.max = 0.9
@@ -101,19 +101,31 @@ class PreProcess:
             tmp_audio.astype(np.float32),
         )
 
-    def pipeline(self, path, idx0):
-    try:
-        audio = load_audio(path, self.sr, DoFormant, Quefrency, Timbre)
-        audio = signal.lfilter(self.bh, self.ah, audio)
+     def pipeline(self, path, idx0):
+        try:
+            audio = load_audio(path, self.sr, DoFormant, Quefrency, Timbre)
+            # zero phased digital filter cause pre-ringing noise...
+            # audio = signal.filtfilt(self.bh, self.ah, audio)
+            audio = signal.lfilter(self.bh, self.ah, audio)
 
-        idx1 = 0
-        segments = self.slicer.slice(audio)
-        for segment in segments:
-            self.norm_write(segment, idx0, idx1)
-            idx1 += 1
-        println("%s->Suc." % path)
-    except:
-        println("%s->%s" % (path, traceback.format_exc()))
+            idx1 = 0
+            for audio in self.slicer.slice(audio):
+                i = 0
+                while 1:
+                    start = int(self.sr * (self.per - self.overlap) * i)
+                    i += 1
+                    if len(audio[start:]) > self.tail * self.sr:
+                        tmp_audio = audio[start : start + int(self.per * self.sr)]
+                        self.norm_write(tmp_audio, idx0, idx1)
+                        idx1 += 1
+                    else:
+                        tmp_audio = audio[start:]
+                        idx1 += 1
+                        break
+                self.norm_write(tmp_audio, idx0, idx1)
+            println("%s->Suc." % path)
+        except:
+            println("%s->%s" % (path, traceback.format_exc()))
 
 
     def pipeline_mp(self, infos):
